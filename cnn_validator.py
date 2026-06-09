@@ -1,147 +1,90 @@
-import argparse
-import json
-import os
-import re
-import sys
+import argparse, json, os, re, sys, cv2, numpy as np, tensorflow as tf, pytesseract
 from pathlib import Path
 
-# Matikan pesan error TensorFlow yang berisik
+# Path Tesseract di Railway (Server Linux)
+pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
+
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
-import cv2
-import numpy as np
-import tensorflow as tf
-
 def parse_args():
-    parser = argparse.ArgumentParser(description="CNN validator untuk digit meter air.")
-    parser.add_argument("image_path", help="Gambar meter.")
-    parser.add_argument("model_path", help="Model CNN .keras/.h5.")
-    parser.add_argument("previous_meter", type=int, help="Meter sebelumnya.")
-    parser.add_argument("processed_dir", help="Folder output preview.")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("image_path")
+    parser.add_argument("model_path")
+    parser.add_argument("previous_meter", type=int)
+    parser.add_argument("processed_dir")
     parser.add_argument("--image-size", type=int, default=64)
     parser.add_argument("--max-digits", type=int, default=6)
     return parser.parse_args()
 
-def ensure_dir(path_str):
-    path = Path(path_str)
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-def normalize_digits(text):
-    digits = re.sub(r"\D", "", text or "")
-    if digits == "": return ""
-    return digits.lstrip("0") or "0"
-
-def load_image(path_str):
-    image = cv2.imread(path_str)
-    if image is None: raise RuntimeError("Gambar tidak dapat dibaca oleh OpenCV.")
-    return image
-
 def preprocess_roi(image):
-    # 1. Konversi ke Grayscale
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    
-    # 2. 🔥 PERBAIKAN UTAMA: Gunakan THRESH_BINARY (Tanpa INV)
-    # Ini akan membuat angka Hitam (0) di latar Putih (255), sesuai dengan dataset trainingmu.
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    
     return gray, binary
 
 def segment_digits(binary):
-    # DILASI agar garis yang putus menyambung kembali
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     binary = cv2.dilate(binary, kernel, iterations=1)
-    
     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
     height, width = binary.shape[:2]
     boxes = []
-    
-    # FILTER DIPERLONGGAR
-    for contour in contours:
-        x, y, w, h = cv2.boundingRect(contour)
-        # Ambil kontur yang punya tinggi minimal 15% dari ROI (untuk menghindari noise/bintik)
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
         if h > height * 0.15 and w > width * 0.01:
             boxes.append((x, y, w, h))
+    boxes.sort(key=lambda b: b[0])
+    return boxes
 
-    # Urutkan dari kiri ke kanan
-    boxes.sort(key=lambda box: box[0])
-    
-    # Gabungkan kotak yang saling tumpang tindih
-    merged = []
-    for box in boxes:
-        if not merged:
-            merged.append(box)
-        else:
-            px, py, pw, ph = merged[-1]
-            x, y, w, h = box
-            # Jika kotak berdekatan, gabungkan
-            if x < (px + pw + 5):
-                nx = min(px, x); ny = min(py, y)
-                nr = max(px + pw, x + w); nb = max(py + ph, y + h)
-                merged[-1] = (nx, ny, nr - nx, nb - ny)
-            else:
-                merged.append(box)
-    return merged
-
-def crop_digit(gray_image, box, image_size):
+def crop_digit(gray, box, image_size):
     x, y, w, h = box
-    pad = 2
-    x0, y0 = max(x-pad, 0), max(y-pad, 0)
-    x1, y1 = min(x+w+pad, gray_image.shape[1]), min(y+h+pad, gray_image.shape[0])
-    
-    # 🔥 PENTING: Potong dari GRAY_IMAGE, bukan binary!
-    digit = gray_image[y0:y1, x0:x1]
-    
-    # Buat latar putih (255) agar AI tidak bingung
-    canvas_size = max(digit.shape[:2]) + 4
-    canvas = np.full((canvas_size, canvas_size), 255, dtype=np.uint8)
-    
-    y_off = (canvas_size - digit.shape[0]) // 2
-    x_off = (canvas_size - digit.shape[1]) // 2
-    canvas[y_off:y_off+digit.shape[0], x_off:x_off+digit.shape[1]] = digit
-    
-    # Resize ke 64x64
-    resized = cv2.resize(canvas, (image_size, image_size), interpolation=cv2.INTER_AREA)
-    
-    # 🔥 INI KUNCINYA: Jika modelmu dilatih angka Hitam di latar Putih, 
-    # maka biarkan seperti ini. Jika modelmu menebak ngaco, buka komentar bawah ini:
-    # resized = cv2.bitwise_not(resized)
-    
-    return resized
+    digit = gray[max(0, y):min(gray.shape[0], y+h), max(0, x):min(gray.shape[1], x+w)]
+    canvas = np.full((64, 64), 255, dtype=np.uint8)
+    h_d, w_d = digit.shape
+    y_off, x_off = (64-h_d)//2, (64-w_d)//2
+    canvas[y_off:y_off+h_d, x_off:x_off+w_d] = digit
+    return cv2.resize(canvas, (image_size, image_size))
 
-def predict_digits(model, gray_image, boxes, image_size):
-    digit_images = [crop_digit(gray_image, box, image_size) for box in boxes]
-    batch = np.asarray(digit_images, dtype=np.float32) / 255.0 # Normalisasi
+def predict_digits(model, gray, boxes, size):
+    imgs = [crop_digit(gray, b, size) for b in boxes]
+    batch = np.asarray(imgs, dtype=np.float32) / 255.0
     batch = np.expand_dims(batch, axis=-1)
-    
-    predictions = model.predict(batch, verbose=0)
-    digits = [str(int(np.argmax(p))) for p in predictions]
-    confs = [float(np.max(p) * 100) for p in predictions]
-    return "".join(digits), confs, digit_images
+    preds = model.predict(batch, verbose=0)
+    digits = [str(int(np.argmax(p))) for p in preds]
+    confs = [float(np.max(p)*100) for p in preds]
+    return "".join(digits), confs
+
+def run_tesseract(source_img):
+    # Preprocess untuk Tesseract: Upscale agar terbaca
+    gray = cv2.cvtColor(source_img, cv2.COLOR_BGR2GRAY)
+    gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # OCR khusus angka
+    text = pytesseract.image_to_string(binary, config='--psm 7 -c tessedit_char_whitelist=0123456789')
+    return re.sub(r"\D", "", text)
 
 def main():
     args = parse_args()
-    source = load_image(args.image_path)
+    source = cv2.imread(args.image_path)
     gray, binary = preprocess_roi(source)
     boxes = segment_digits(binary)
-    boxes = boxes[:args.max_digits]
-
-    model = tf.keras.models.load_model(args.model_path)
     
-    digits = ""
-    conf = 0
-    if boxes:
-        raw_digits, confs, _ = predict_digits(model, gray, boxes, args.image_size)
-        digits = normalize_digits(raw_digits)
-        conf = round(float(np.mean(confs)), 2)
+    # 1. Jalankan CNN
+    model = tf.keras.models.load_model(args.model_path)
+    cnn_digits, confs = predict_digits(model, gray, boxes, args.image_size)
+    avg_conf = np.mean(confs) if confs else 0
+    
+    # 2. LOGIKA HYBRID
+    # Jika conf < 80% ATAU hasil repetitif (11111), pakai Tesseract
+    final_digits = cnn_digits
+    engine = "cnn"
+    if avg_conf < 80 or re.match(r"(\d)\1{3,}", cnn_digits):
+        final_digits = run_tesseract(source)
+        engine = "tesseract"
 
     print(json.dumps({
         "success": True,
-        "normalized_text": digits,
-        "confidence": conf,
-        "is_valid": len(digits) >= 4,
-        "engine": "cnn-validator-final"
+        "normalized_text": final_digits,
+        "confidence": round(float(avg_conf), 2),
+        "engine": engine
     }))
 
 if __name__ == "__main__":
