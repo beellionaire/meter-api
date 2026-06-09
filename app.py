@@ -8,10 +8,6 @@ import json
 app = Flask(__name__)
 CORS(app)
 
-@app.route('/', methods=['GET'])
-def index():
-    return jsonify({"status": "API PaddleOCR Aktif!"})
-
 @app.route('/api/ocr', methods=['POST'])
 def process_ocr():
     try:
@@ -19,20 +15,22 @@ def process_ocr():
         if not data or 'image' not in data:
             return jsonify({'success': False, 'message': 'Tidak ada gambar yang dikirim'})
 
-        # Decode Base64 dari PHP
+        # Decode Base64 dari PHP Hostinger
         image_data = data['image'].split(',')[1]
         with open('temp.jpg', 'wb') as f:
             f.write(base64.b64decode(image_data))
 
-        # Eksekusi Skrip PaddleOCR
-        cmd = ["python", "paddle_validator.py", "temp.jpg"]
+        # Panggil Mesin Hybrid (Paddle + CNN)
+        cmd = [
+            "python", "cnn_validator.py", 
+            "temp.jpg", 
+            "models/cnn_digit_meter.keras"
+        ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         
-        # Hapus file sementara
         if os.path.exists('temp.jpg'):
             os.remove('temp.jpg')
 
-        # Kembalikan output JSON
         return jsonify(json.loads(result.stdout))
 
     except Exception as e:

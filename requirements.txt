@@ -2,6 +2,7 @@ Flask==3.0.0
 flask-cors
 opencv-python-headless
 numpy
+tensorflow
 paddlepaddle
 paddleocr
 gunicorn
