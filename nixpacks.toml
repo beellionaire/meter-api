@@ -1,2 +1,11 @@
+[providers]
+providers = ['python']
+
 [phases.setup]
-aptPkgs = ["libgl1-mesa-glx", "libglib2.0-0", "libgomp1"]
+aptPkgs = ['libgl1', 'libglib2.0-0']
+
+[phases.install]
+cmds = ['pip install -r requirements.txt']
+
+[start]
+cmd = "gunicorn main:app --bind 0.0.0.0:$PORT"

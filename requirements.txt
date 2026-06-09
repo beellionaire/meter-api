@@ -1,7 +1,6 @@
-Flask
+flask
 flask-cors
+gunicorn
 opencv-python-headless
 numpy
-paddlepaddle
-paddleocr
-gunicorn
+tensorflow-cpu
