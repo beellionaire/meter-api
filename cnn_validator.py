@@ -38,30 +38,36 @@ def load_image(path_str):
     return image
 
 def preprocess_roi(image):
-    # Ubah ke Grayscale
+    # 1. Konversi ke Grayscale
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    # Binary untuk deteksi kontur (segmentasi)
-    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    
+    # 2. 🔥 PERBAIKAN UTAMA: Gunakan THRESH_BINARY (Tanpa INV)
+    # Ini akan membuat angka Hitam (0) di latar Putih (255), sesuai dengan dataset trainingmu.
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    
     return gray, binary
 
 def segment_digits(binary):
-    # Bersihkan noise
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
-    cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # DILASI agar garis yang putus menyambung kembali
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    binary = cv2.dilate(binary, kernel, iterations=1)
+    
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     height, width = binary.shape[:2]
     boxes = []
+    
+    # FILTER DIPERLONGGAR
     for contour in contours:
         x, y, w, h = cv2.boundingRect(contour)
-        # Filter kotak yang masuk akal (Tinggi minimal 20% tinggi ROI)
-        if h > height * 0.20 and w > width * 0.01:
+        # Ambil kontur yang punya tinggi minimal 15% dari ROI (untuk menghindari noise/bintik)
+        if h > height * 0.15 and w > width * 0.01:
             boxes.append((x, y, w, h))
 
     # Urutkan dari kiri ke kanan
     boxes.sort(key=lambda box: box[0])
     
-    # Gabungkan kotak yang berdekatan
+    # Gabungkan kotak yang saling tumpang tindih
     merged = []
     for box in boxes:
         if not merged:
@@ -69,6 +75,7 @@ def segment_digits(binary):
         else:
             px, py, pw, ph = merged[-1]
             x, y, w, h = box
+            # Jika kotak berdekatan, gabungkan
             if x < (px + pw + 5):
                 nx = min(px, x); ny = min(py, y)
                 nr = max(px + pw, x + w); nb = max(py + ph, y + h)
