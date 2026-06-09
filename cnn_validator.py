@@ -11,6 +11,13 @@ import cv2
 import numpy as np
 import tensorflow as tf
 
+
+ANCHOR_X = 0.28
+ANCHOR_Y = 0.26
+ANCHOR_W = 0.45
+ANCHOR_H = 0.16
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="CNN validator untuk digit meter air.")
     parser.add_argument("image_path", help="Gambar meter, ROI, atau hasil preprocessing.")
@@ -21,10 +28,12 @@ def parse_args():
     parser.add_argument("--max-digits", type=int, default=6)
     return parser.parse_args()
 
+
 def ensure_dir(path_str):
     path = Path(path_str)
     path.mkdir(parents=True, exist_ok=True)
     return path
+
 
 def normalize_digits(text):
     digits = re.sub(r"\D", "", text or "")
@@ -33,91 +42,124 @@ def normalize_digits(text):
     trimmed = digits.lstrip("0")
     return "0" if trimmed == "" else trimmed
 
+
 def load_image(path_str):
     image = cv2.imread(path_str)
     if image is None:
         raise RuntimeError("Gambar tidak dapat dibaca oleh OpenCV.")
     return image
 
+
+def crop_meter_roi(image):
+    # 1. Ubah ke grayscale & blur
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    
+    # 2. Canny Edge Detection untuk mencari tepi kotak
+    edged = cv2.Canny(blurred, 50, 150)
+    
+    # 3. Cari Kontur
+    contours, _ = cv2.findContours(edged, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    # 4. Cari kontur yang berbentuk kotak (meteran biasanya punya kotak panjang)
+    best_rect = None
+    max_area = 0
+    
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        aspect_ratio = float(w)/h
+        # Meteran air biasanya punya kotak panjang (aspect ratio > 2)
+        if aspect_ratio > 2.0 and w > 100 and h > 20: 
+            if w * h > max_area:
+                max_area = w * h
+                best_rect = (x, y, w, h)
+    
+    # Jika tidak ketemu kotak, baru pakai fallback ke metode lama (agar tidak crash)
+    if best_rect:
+        x, y, w, h = best_rect
+        # Tambahkan padding sedikit agar angka tidak mepet ke tepi
+        pad = 5
+        return image[max(0, y-pad):min(image.shape[0], y+h+pad), 
+                     max(0, x-pad):min(image.shape[1], x+w+pad)]
+    else:
+        # Fallback ke tengah gambar jika deteksi kotak gagal
+        h, w = image.shape[:2]
+        return image[int(h*0.3):int(h*0.5), int(w*0.2):int(w*0.8)]
+
+
+# ... (Simpan bagian atas file seperti biasa, ubah fungsi di bawah ini) ...
+
 def preprocess_roi(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-    blurred = cv2.GaussianBlur(gray, (3, 3), 0)
-    # Binary Inverse HANYA digunakan untuk mencari kontur/kotak, BUKAN untuk dibaca AI
-    _, binary = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    # Gunakan threshold sederhana (BINARY, bukan BINARY_INV) agar angka Hitam di latar Putih
+    # Sesuaikan dengan dataset train-mu (jika dataset train latar putih, gunakan THRESH_BINARY)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return gray, binary
 
 def segment_digits(binary):
-    # Gunakan kernel yang lebih kecil agar tidak menghapus detail angka
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))
-    cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-    contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # DILASI sedikit agar angka yang terputus (karena garis meteran) menyambung kembali
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    binary = cv2.dilate(binary, kernel, iterations=1)
+    
+    contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     height, width = binary.shape[:2]
     boxes = []
+    
+    # FILTER DIPERLONGGAR
     for contour in contours:
         x, y, w, h = cv2.boundingRect(contour)
-        
-        # FILTER YANG LEBIH LONGGAR (Supaya tidak ada digit yang dibuang)
-        # Kita hanya membuang yang ukurannya sangat kecil (noise/bintik)
-        if h > height * 0.15 and w > width * 0.02: 
+        # Jika kotak terlalu kecil (kurang dari 10% tinggi gambar), anggap noise
+        if h > height * 0.15 and w > width * 0.01:
             boxes.append((x, y, w, h))
 
-    if not boxes:
-        return []
-
-    # Sort dari kiri ke kanan
+    # Sort dari kiri ke kanan berdasarkan X
     boxes.sort(key=lambda box: box[0])
     
-    # Gabungkan kotak yang berdekatan (karena angka mungkin terpotong garis)
+    # Gabungkan kotak yang saling tumpang tindih (Sering terjadi pada angka 1)
     merged = []
     for box in boxes:
         if not merged:
             merged.append(box)
-            continue
-        px, py, pw, ph = merged[-1]
-        x, y, w, h = box
-        # Jika kotak tumpang tindih atau sangat dekat, gabungkan
-        if x < (px + pw + 5):
-            nx = min(px, x)
-            ny = min(py, y)
-            nr = max(px + pw, x + w)
-            nb = max(py + ph, y + h)
-            merged[-1] = (nx, ny, nr - nx, nb - ny)
         else:
-            merged.append(box)
-            
+            px, py, pw, ph = merged[-1]
+            x, y, w, h = box
+            # Jika kotak baru berdekatan atau tumpang tindih dengan sebelumnya, gabung
+            if x < (px + pw + 5):
+                nx = min(px, x)
+                ny = min(py, y)
+                nr = max(px + pw, x + w)
+                nb = max(py + ph, y + h)
+                merged[-1] = (nx, ny, nr - nx, nb - ny)
+            else:
+                merged.append(box)
     return merged
 
-def crop_digit(gray_image, box, image_size):
+# ... (sisanya fungsi crop_digit, predict_digits, main tetap sama) ...
+
+
+def crop_digit(binary, box, image_size):
     x, y, w, h = box
     pad = max(int(max(w, h) * 0.18), 3)
     x0 = max(x - pad, 0)
     y0 = max(y - pad, 0)
-    x1 = min(x + w + pad, gray_image.shape[1])
-    y1 = min(y + h + pad, gray_image.shape[0])
-    
-    # Memotong dari gambar ABU-ABU (Grayscale), BUKAN gambar hitam putih invert
-    digit = gray_image[y0:y1, x0:x1]
+    x1 = min(x + w + pad, binary.shape[1])
+    y1 = min(y + h + pad, binary.shape[0])
+    digit = binary[y0:y1, x0:x1]
 
     canvas_size = max(digit.shape[:2]) + 8
-    
-    # 🔥 KUNCI PERBAIKAN 11111: KANVAS PUTIH (255) BUKAN HITAM (0) 🔥
-    # Agar serasi dengan latar belakang kertas meteran asli
-    canvas = np.full((canvas_size, canvas_size), 255, dtype=np.uint8) 
-    
+    canvas = np.zeros((canvas_size, canvas_size), dtype=np.uint8)
     y_offset = (canvas_size - digit.shape[0]) // 2
     x_offset = (canvas_size - digit.shape[1]) // 2
     canvas[y_offset:y_offset + digit.shape[0], x_offset:x_offset + digit.shape[1]] = digit
     resized = cv2.resize(canvas, (image_size, image_size), interpolation=cv2.INTER_AREA)
     return resized
 
-def predict_digits(model, gray_image, boxes, image_size):
-    # Kirim gray_image ke crop_digit, BUKAN binary!
-    digit_images = [crop_digit(gray_image, box, image_size) for box in boxes]
+
+def predict_digits(model, binary, boxes, image_size):
+    digit_images = [crop_digit(binary, box, image_size) for box in boxes]
     batch = np.asarray(digit_images, dtype=np.float32)
     batch = np.expand_dims(batch, axis=-1)
-    
     predictions = model.predict(batch, verbose=0)
 
     digits = []
@@ -129,6 +171,7 @@ def predict_digits(model, gray_image, boxes, image_size):
         confidences.append(confidence)
 
     return "".join(digits), confidences, digit_images
+
 
 def save_preview(processed_dir, roi, binary, digit_images):
     out_dir = ensure_dir(processed_dir)
@@ -147,17 +190,23 @@ def save_preview(processed_dir, roi, binary, digit_images):
 
     return roi_path, binary_path, digits_path
 
+
 def validate(digits, previous_meter):
     errors = []
     if digits == "":
         errors.append("CNN tidak menemukan digit pada area ROI.")
-    # Validasi panjang angka kita matikan batas ketatnya, kembalikan max-digits saja
+    if digits != "" and len(digits) > 6:
+        errors.append("Panjang digit CNN melebihi rentang yang wajar.")
+    if digits != "" and int(digits) < previous_meter:
+        errors.append("Meter hasil CNN lebih kecil dari meter sebelumnya.")
     return errors
+
 
 def relative_upload_path(path):
     if path is None:
         return None
     return "uploads/processed/" + Path(path).name
+
 
 def main():
     args = parse_args()
@@ -166,19 +215,14 @@ def main():
         raise RuntimeError(f"Model CNN tidak ditemukan: {model_path}")
 
     source = load_image(args.image_path)
-    
-    # 🔥 KUNCI PERBAIKAN "DITOLAK SERVER": MATIKAN DOUBLE CROPPING! 🔥
-    # Karena PHP sudah memotong dengan benar, kita langsung pakai gambar aslinya sebagai ROI
-    roi = source 
-    
+    roi = crop_meter_roi(source)
     gray, binary = preprocess_roi(roi)
     boxes = segment_digits(binary)
     boxes = boxes[:args.max_digits]
 
     model = tf.keras.models.load_model(model_path)
     if boxes:
-        # Kirim GRAYSCALE (Abu-abu), BUKAN Binary Invert ke fungsi prediksi!
-        raw_digits, confidences, digit_images = predict_digits(model, gray, boxes, args.image_size)
+        raw_digits, confidences, digit_images = predict_digits(model, binary, boxes, args.image_size)
         digits = normalize_digits(raw_digits)
         confidence = round(float(np.mean(confidences)), 2) if confidences else None
     else:
@@ -203,6 +247,7 @@ def main():
         "binary_relative": relative_upload_path(binary_path),
         "digit_count": len(boxes),
     }))
+
 
 if __name__ == "__main__":
     try:
