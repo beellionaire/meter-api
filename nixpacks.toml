@@ -2,4 +2,4 @@
 aptPkgs = ["libgl1-mesa-glx", "libglib2.0-0", "libgomp1"]
 
 [start]
-cmd = "gunicorn --bind 0.0.0.0:$PORT app:app --workers 1 --timeout 120"
+cmd = "python app.py"
