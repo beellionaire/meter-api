@@ -1,7 +1,7 @@
 Flask==3.0.0
 flask-cors
-tensorflow
 opencv-python-headless
 numpy
-pytesseract
-pillow
+paddlepaddle
+paddleocr
+gunicorn
