@@ -91,8 +91,8 @@ def crop_meter_roi(image):
 
 def preprocess_roi(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    # Gunakan threshold sederhana (BINARY, bukan BINARY_INV) agar angka Hitam di latar Putih
-    # Sesuaikan dengan dataset train-mu (jika dataset train latar putih, gunakan THRESH_BINARY)
+    # Gunakan THRESH_BINARY (tanpa INV) agar angka Hitam di atas latar Putih
+    # Sesuai dengan dataset training kamu
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return gray, binary
 
@@ -138,21 +138,21 @@ def segment_digits(binary):
 # ... (sisanya fungsi crop_digit, predict_digits, main tetap sama) ...
 
 
-def crop_digit(binary, box, image_size):
+def crop_digit(gray_image, box, image_size):
     x, y, w, h = box
-    pad = max(int(max(w, h) * 0.18), 3)
-    x0 = max(x - pad, 0)
-    y0 = max(y - pad, 0)
-    x1 = min(x + w + pad, binary.shape[1])
-    y1 = min(y + h + pad, binary.shape[0])
-    digit = binary[y0:y1, x0:x1]
-
-    canvas_size = max(digit.shape[:2]) + 8
-    canvas = np.zeros((canvas_size, canvas_size), dtype=np.uint8)
-    y_offset = (canvas_size - digit.shape[0]) // 2
-    x_offset = (canvas_size - digit.shape[1]) // 2
-    canvas[y_offset:y_offset + digit.shape[0], x_offset:x_offset + digit.shape[1]] = digit
-    resized = cv2.resize(canvas, (image_size, image_size), interpolation=cv2.INTER_AREA)
+    pad = 2 # Padding sedikit
+    x0, y0 = max(x-pad, 0), max(y-pad, 0)
+    x1, y1 = min(x+w+pad, gray_image.shape[1]), min(y+h+pad, gray_image.shape[0])
+    
+    digit = gray_image[y0:y1, x0:x1]
+    
+    # Resize ke 64x64
+    resized = cv2.resize(digit, (image_size, image_size), interpolation=cv2.INTER_AREA)
+    
+    # 🔥 INI KUNCINYA: Jika modelmu dilatih dengan angka Hitam (0) di latar Putih (255)
+    # kita harus memastikan inputnya seperti itu. Jika modelmu menebak 1111,
+    # coba ganti line di bawah ini menjadi: resized = cv2.bitwise_not(resized)
+    
     return resized
 
 
