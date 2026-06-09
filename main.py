@@ -149,7 +149,7 @@ def process_ocr():
             
             predictions = cnn_model.predict(img_array, verbose=0)
             result_digits += str(np.argmax(predictions[0]))
-            confidences.append(np.max(predictions[0]) * 100)
+            confidences.append(float(np.max(predictions[0]) * 100))
 
         avg_confidence = sum(confidences) / len(confidences)
         
@@ -160,7 +160,7 @@ def process_ocr():
         return jsonify({
             "success": True,
             "normalized_text": result_digits,
-            "confidence": round(avg_confidence, 2),
+            "confidence": float(round(avg_confidence, 2)),
             "roi_image": roi_base64,
             "engine": "railway-python-cnn-api"
         })
