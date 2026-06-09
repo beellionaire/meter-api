@@ -90,15 +90,28 @@ def process_ocr():
     if cnn_model is None:
         return jsonify({"success": False, "message": "Model AI belum terpasang di server Railway."}), 500
 
-    data = request.get_json()
-    if not data or 'image' or 'image' not in data:
-        return jsonify({"success": False, "message": "Gambar tidak dikirim."}), 400
+    # PERBAIKAN: Gunakan force=True agar Flask memaksa baca JSON walau header dimodifikasi proxy
+    data = request.get_json(force=True, silent=True)
+    
+    if data is None:
+        return jsonify({"success": False, "message": "Format request bukan JSON atau payload terlalu besar."}), 400
+
+    if 'image' not in data or not data['image']:
+        return jsonify({"success": False, "message": "Field 'image' kosong atau tidak ditemukan."}), 400
 
     try:
         # Decode gambar base64 dari Hostinger
-        encoded_data = data['image'].split(',')[1]
+        encoded_data = data['image']
+        # Pastikan kita hanya mengambil data setelah koma (base64 murni)
+        if ',' in encoded_data:
+            encoded_data = encoded_data.split(',')[1]
+            
         nparr = np.frombuffer(base64.b64decode(encoded_data), np.uint8)
         source = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+        # Validasi jika gambar Base64 terpotong/rusak saat di perjalanan
+        if source is None:
+            return jsonify({"success": False, "message": "Gambar rusak saat dikirim dari Hostinger."}), 400
 
         # Preprocessing Gambar
         height, width = source.shape[:2]
@@ -152,7 +165,8 @@ def process_ocr():
         })
 
     except Exception as e:
-        return jsonify({"success": False, "message": str(e)}), 500
+        # Menangkap error spesifik di server
+        return jsonify({"success": False, "message": "Internal Server Error: " + str(e)}), 500
 
 if __name__ == '__main__':
     # Jalankan server internal jika lokal test
