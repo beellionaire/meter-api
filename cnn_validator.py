@@ -1,20 +1,7 @@
 import argparse, json, os, re, sys, cv2, numpy as np, tensorflow as tf, pytesseract
 from pathlib import Path
-
-# Path Tesseract di Railway (Server Linux)
-pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
-
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("image_path")
-    parser.add_argument("model_path")
-    parser.add_argument("previous_meter", type=int)
-    parser.add_argument("processed_dir")
-    parser.add_argument("--image-size", type=int, default=64)
-    parser.add_argument("--max-digits", type=int, default=6)
-    return parser.parse_args()
+pytesseract.pytesseract.tesseract_cmd = '/usr/bin/tesseract'
 
 def preprocess_roi(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -53,42 +40,34 @@ def predict_digits(model, gray, boxes, size):
     return "".join(digits), confs
 
 def run_tesseract(source_img):
-    # Preprocess untuk Tesseract: Upscale agar terbaca
     gray = cv2.cvtColor(source_img, cv2.COLOR_BGR2GRAY)
     gray = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    # OCR khusus angka
     text = pytesseract.image_to_string(binary, config='--psm 7 -c tessedit_char_whitelist=0123456789')
     return re.sub(r"\D", "", text)
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("image_path"); parser.add_argument("model_path"); parser.add_argument("previous_meter", type=int); parser.add_argument("processed_dir")
+    args = parser.parse_args()
+    
     source = cv2.imread(args.image_path)
     gray, binary = preprocess_roi(source)
     boxes = segment_digits(binary)
-    
-    # 1. Jalankan CNN
     model = tf.keras.models.load_model(args.model_path)
-    cnn_digits, confs = predict_digits(model, gray, boxes, args.image_size)
+    
+    cnn_digits, confs = predict_digits(model, gray, boxes, 64)
     avg_conf = np.mean(confs) if confs else 0
     
-    # 2. LOGIKA HYBRID
-    # Jika conf < 80% ATAU hasil repetitif (11111), pakai Tesseract
+    # HYBRID LOGIC
     final_digits = cnn_digits
     engine = "cnn"
     if avg_conf < 80 or re.match(r"(\d)\1{3,}", cnn_digits):
         final_digits = run_tesseract(source)
         engine = "tesseract"
 
-    print(json.dumps({
-        "success": True,
-        "normalized_text": final_digits,
-        "confidence": round(float(avg_conf), 2),
-        "engine": engine
-    }))
+    print(json.dumps({"success": True, "normalized_text": final_digits, "confidence": round(float(avg_conf), 2), "engine": engine}))
 
 if __name__ == "__main__":
     try: main()
-    except Exception as e:
-        print(json.dumps({"success": False, "message": str(e)}))
-        sys.exit(1)
+    except Exception as e: print(json.dumps({"success": False, "message": str(e)}))
