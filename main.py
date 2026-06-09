@@ -91,7 +91,7 @@ def process_ocr():
         return jsonify({"success": False, "message": "Model AI belum terpasang di server Railway."}), 500
 
     data = request.get_json()
-    if not data or 'image' Bone or 'image' not in data:
+    if not data or 'image' or 'image' not in data:
         return jsonify({"success": False, "message": "Gambar tidak dikirim."}), 400
 
     try:
