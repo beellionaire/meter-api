@@ -48,7 +48,8 @@ def preprocess_roi(image):
     return gray, binary
 
 def segment_digits(binary):
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    # Gunakan kernel yang lebih kecil agar tidak menghapus detail angka
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 1))
     cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
     contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
@@ -56,29 +57,28 @@ def segment_digits(binary):
     boxes = []
     for contour in contours:
         x, y, w, h = cv2.boundingRect(contour)
-        # Toleransi dilonggarkan sedikit agar angka 1 yang tipis tetap masuk
-        if h < height * 0.25:
-            continue
-        if w < width * 0.015 or w > width * 0.35:
-            continue
-        boxes.append((x, y, w, h))
+        
+        # FILTER YANG LEBIH LONGGAR (Supaya tidak ada digit yang dibuang)
+        # Kita hanya membuang yang ukurannya sangat kecil (noise/bintik)
+        if h > height * 0.15 and w > width * 0.02: 
+            boxes.append((x, y, w, h))
 
     if not boxes:
         return []
 
+    # Sort dari kiri ke kanan
     boxes.sort(key=lambda box: box[0])
-    median_height = float(np.median([box[3] for box in boxes]))
-    filtered = [box for box in boxes if box[3] >= median_height * 0.55]
-
+    
+    # Gabungkan kotak yang berdekatan (karena angka mungkin terpotong garis)
     merged = []
-    for box in filtered:
+    for box in boxes:
         if not merged:
             merged.append(box)
             continue
         px, py, pw, ph = merged[-1]
         x, y, w, h = box
-        gap = x - (px + pw)
-        if gap <= max(2, int(width * 0.02)):
+        # Jika kotak tumpang tindih atau sangat dekat, gabungkan
+        if x < (px + pw + 5):
             nx = min(px, x)
             ny = min(py, y)
             nr = max(px + pw, x + w)
@@ -86,7 +86,7 @@ def segment_digits(binary):
             merged[-1] = (nx, ny, nr - nx, nb - ny)
         else:
             merged.append(box)
-
+            
     return merged
 
 def crop_digit(gray_image, box, image_size):
