@@ -12,9 +12,9 @@ import tensorflow as tf
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 app = Flask(__name__)
-CORS(app) # Mengizinkan Hostinger memanggil API ini tanpa terkena blokir CORS
+CORS(app) # Mengizinkan Hostinger memanggil API ini
 
-# --- LOAD MODEL CNN SECARA GLOBAL (HANYA 1 KALI SAAT START) ---
+# --- LOAD MODEL CNN SECARA GLOBAL ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "models", "cnn_digit_meter.keras")
 
@@ -85,23 +85,17 @@ def find_digit_roi(image, gray, edges):
     final_y = anchor_y + y
     return image[final_y:final_y + ch, final_x:final_x + cw]
 
-# --- ROUTE UTAMA API ---
 @app.route('/api/ocr', methods=['POST'])
 def process_ocr():
     if cnn_model is None:
         return jsonify({"success": False, "message": "Model AI belum terpasang di server Railway."}), 500
 
-    # PERBAIKAN: Gunakan force=True agar Flask memaksa baca JSON walau header dimodifikasi proxy
     data = request.get_json(force=True, silent=True)
     
-    if data is None:
-        return jsonify({"success": False, "message": "Format request bukan JSON atau payload terlalu besar."}), 400
-
-    if 'image' not in data or not data['image']:
+    if data is None or 'image' not in data or not data['image']:
         return jsonify({"success": False, "message": "Field 'image' kosong atau tidak ditemukan."}), 400
 
     try:
-        # Decode gambar base64
         encoded_data = data['image']
         if ',' in encoded_data:
             encoded_data = encoded_data.split(',')[1]
@@ -112,14 +106,11 @@ def process_ocr():
         if source is None:
             return jsonify({"success": False, "message": "Gambar rusak saat dikirim dari Hostinger."}), 400
 
-        # CEK SINYAL DARI HOSTINGER: Apakah sudah dipotong dari web?
         is_cropped = data.get('is_cropped', False)
 
         if is_cropped:
-            # JANGAN KEMANA-MANA: Langsung pakai gambar hasil guntingan dari Web!
             roi_trimmed = source
         else:
-            # JIKA USER UPLOAD FOTO DARI GALERI: Gunakan OpenCV untuk mencari kotaknya
             height, width = source.shape[:2]
             if width > 1400:
                 scale = 1400 / float(width)
@@ -134,21 +125,67 @@ def process_ocr():
             rcw, rch = min(max(int(rw * 0.96), 1), rw - rx), min(max(int(rh * 0.80), 1), rh - ry)
             roi_trimmed = roi[ry:ry + rch, rx:rx + rcw]
 
-        # PROSES POTONG 5 DIGIT SECARA RATA
         roi_gray = grayscale(roi_trimmed)
         th, tw = roi_gray.shape
-        digit_width = tw // 5
+
+        # --- AUTO-ALIGNMENT TRACKER (MENYEMPITKAN ROI KE BLOK ANGKA) ---
+        thresh = cv2.adaptiveThreshold(roi_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 10)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        valid_x = []
+        for ctr in contours:
+            bx, by, bw, bh = cv2.boundingRect(ctr)
+            if bh > th * 0.40 and bh < th * 0.95 and bw < tw * 0.25:
+                valid_x.extend([bx, bx + bw])
+        
+        if len(valid_x) > 0:
+            min_x = max(min(valid_x) - 3, 0)
+            max_x = min(max(valid_x) + 3, tw)
+            digit_block = roi_gray[:, min_x:max_x]
+        else:
+            digit_block = roi_gray
+
+        bh, bw = digit_block.shape
+        digit_width = bw // 5
         
         result_digits = ""
         confidences = []
+        debug_crops = []
         
         for i in range(5):
             start_x = i * digit_width
-            end_x = (i + 1) * digit_width if i < 4 else tw
-            digit_crop = roi_gray[:, start_x:end_x]
+            end_x = (i + 1) * digit_width if i < 4 else bw
+            digit_crop = digit_block[:, start_x:end_x]
             
-            resized_crop = cv2.resize(digit_crop, (64, 64), interpolation=cv2.INTER_AREA)
-            img_array = resized_crop.astype('float32')
+            # =================================================================
+            # PERBAIKAN ABSOLUT: TEKNIK 'LETTERBOXING' (ANTI-GEPENG)
+            # =================================================================
+            TARGET_SIZE = 64
+            h, w = digit_crop.shape
+
+            # 1. Pertahankan Aspect Ratio aslinya
+            # Kita ubah ukuran agar tingginya pas 64 piksel, lebar mengikuti secara proporsional.
+            # Menggunakan INTER_AREA untuk downsampling yang bersih, INTER_LINEAR untuk upsampling.
+            interpolation = cv2.INTER_AREA if TARGET_SIZE < h else cv2.INTER_LINEAR
+            scale = TARGET_SIZE / max(h, 1)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+
+            resized_digit = cv2.resize(digit_crop, (new_w, new_h), interpolation=interpolation)
+
+            # 2. Buat kanvas kotak 64x64 dengan warna latar belakang murni (diambil dari median pinggiran)
+            bg_color = int(np.median([digit_crop[0,:], digit_crop[-1,:], digit_crop[:,0], digit_crop[:,-1]]))
+            canvas = np.full((TARGET_SIZE, TARGET_SIZE), bg_color, dtype=np.uint8)
+
+            # 3. Tempelkan angka proporsional tadi tepat di TENGAH kanvas kotak
+            x_offset = (TARGET_SIZE - new_w) // 2
+            y_offset = (TARGET_SIZE - new_h) // 2
+
+            canvas[y_offset : y_offset + new_h, x_offset : x_offset + new_w] = resized_digit
+            
+            # Kita pakai 'canvas' untuk prediksi, bukan 'resized_crop' yang gepeng
+            debug_crops.append(canvas)
+            img_array = canvas.astype('float32')
             img_array = np.expand_dims(np.expand_dims(img_array, axis=-1), axis=0)
             
             predictions = cnn_model.predict(img_array, verbose=0)
@@ -157,8 +194,9 @@ def process_ocr():
 
         avg_confidence = sum(confidences) / len(confidences)
         
-        # Konversi ROI ke base64 untuk dikirim balik
-        _, img_encoded = cv2.imencode('.jpg', roi_trimmed)
+        # Kirimkan representasi visual kotak pangkasan yang dilihat oleh AI
+        debug_view = np.hstack(debug_crops)
+        _, img_encoded = cv2.imencode('.jpg', debug_view)
         roi_base64 = base64.b64encode(img_encoded).decode('utf-8')
 
         return jsonify({
@@ -166,7 +204,7 @@ def process_ocr():
             "normalized_text": result_digits,
             "confidence": float(round(avg_confidence, 2)),
             "roi_image": roi_base64,
-            "engine": "railway-python-cnn-api"
+            "engine": "railway-python-cnn-letterbox-api"
         })
 
     except Exception as e:
