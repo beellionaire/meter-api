@@ -12,7 +12,7 @@ import tensorflow as tf
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 app = Flask(__name__)
-CORS(app) # Mengizinkan Hostinger memanggil API ini
+CORS(app) 
 
 # --- LOAD MODEL CNN SECARA GLOBAL ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -104,7 +104,7 @@ def process_ocr():
         source = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         if source is None:
-            return jsonify({"success": False, "message": "Gambar rusak saat dikirim dari Hostinger."}), 400
+            return jsonify({"success": False, "message": "Gambar rusak saat dikirim."}), 400
 
         is_cropped = data.get('is_cropped', False)
 
@@ -128,23 +128,28 @@ def process_ocr():
         roi_gray = grayscale(roi_trimmed)
         th, tw = roi_gray.shape
 
-        # --- AUTO-ALIGNMENT TRACKER (MENYEMPITKAN ROI KE BLOK ANGKA) ---
+        # =================================================================
+        # TEKNIK PROJECTION PROFILE: Mengunci Blok Angka secara Sempurna
+        # =================================================================
+        # Binarisasi adaptif: jadikan teks putih terang (255) dan background hitam (0)
         thresh = cv2.adaptiveThreshold(roi_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 10)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        valid_x = []
-        for ctr in contours:
-            bx, by, bw, bh = cv2.boundingRect(ctr)
-            if bh > th * 0.40 and bh < th * 0.95 and bw < tw * 0.25:
-                valid_x.extend([bx, bx + bw])
+        # Hitung jumlah piksel putih secara vertikal (kolom per kolom)
+        vertical_sum = np.sum(thresh, axis=0)
         
-        if len(valid_x) > 0:
-            min_x = max(min(valid_x) - 3, 0)
-            max_x = min(max(valid_x) + 3, tw)
+        # Cari batas di mana tinta angka dimulai dan berakhir
+        threshold_val = np.max(vertical_sum) * 0.08  # Toleransi 8%
+        active_cols = np.where(vertical_sum > threshold_val)[0]
+
+        if len(active_cols) > 0:
+            # Ambil koordinat batas kiri dan kanan yang mengandung tulisan angka
+            min_x = max(active_cols[0] - 2, 0)
+            max_x = min(active_cols[-1] + 2, tw)
             digit_block = roi_gray[:, min_x:max_x]
         else:
             digit_block = roi_gray
 
+        # Bagilah blok yang sudah terkunci sempurna itu ke dalam 5 potongan
         bh, bw = digit_block.shape
         digit_width = bw // 5
         
@@ -157,42 +162,11 @@ def process_ocr():
             end_x = (i + 1) * digit_width if i < 4 else bw
             digit_crop = digit_block[:, start_x:end_x]
             
-            # =================================================================
-            # PERBAIKAN ABSOLUT: TEKNIK 'LETTERBOXING' (ANTI-GEPENG)
-            # =================================================================
-            TARGET_SIZE = 64
-            h, w = digit_crop.shape
-
-            # Jika potongan kosong (mencegah error)
-            if h == 0 or w == 0:
-                result_digits += "0"
-                confidences.append(0.0)
-                continue
-
-            # 1. Pertahankan Aspect Ratio aslinya
-            interpolation = cv2.INTER_AREA if TARGET_SIZE < h else cv2.INTER_LINEAR
-            scale = TARGET_SIZE / max(h, 1)
-            new_w = int(w * scale)
-            new_h = int(h * scale)
-
-            resized_digit = cv2.resize(digit_crop, (new_w, new_h), interpolation=interpolation)
-
-            # 2. Buat kanvas kotak 64x64 dengan warna latar belakang murni
-            # PERBAIKAN ERROR NUMPY (menggabungkan sisi menjadi 1 dimensi dulu)
-            bg_pixels = np.concatenate([digit_crop[0,:], digit_crop[-1,:], digit_crop[:,0], digit_crop[:,-1]])
-            bg_color = int(np.median(bg_pixels)) if len(bg_pixels) > 0 else 255
+            # KEMBALI KE METODE STRETCHING MURNI (Sesuai cara Keras Training)
+            resized_crop = cv2.resize(digit_crop, (64, 64), interpolation=cv2.INTER_AREA)
             
-            canvas = np.full((TARGET_SIZE, TARGET_SIZE), bg_color, dtype=np.uint8)
-
-            # 3. Tempelkan angka proporsional tadi tepat di TENGAH kanvas kotak
-            x_offset = (TARGET_SIZE - new_w) // 2
-            y_offset = (TARGET_SIZE - new_h) // 2
-
-            canvas[y_offset : y_offset + new_h, x_offset : x_offset + new_w] = resized_digit
-            
-            # Kita pakai 'canvas' untuk prediksi
-            debug_crops.append(canvas)
-            img_array = canvas.astype('float32')
+            debug_crops.append(resized_crop)
+            img_array = resized_crop.astype('float32')
             img_array = np.expand_dims(np.expand_dims(img_array, axis=-1), axis=0)
             
             predictions = cnn_model.predict(img_array, verbose=0)
@@ -201,7 +175,7 @@ def process_ocr():
 
         avg_confidence = sum(confidences) / len(confidences)
         
-        # Kirimkan representasi visual kotak pangkasan yang dilihat oleh AI
+        # Kirimkan representasi visual
         debug_view = np.hstack(debug_crops)
         _, img_encoded = cv2.imencode('.jpg', debug_view)
         roi_base64 = base64.b64encode(img_encoded).decode('utf-8')
@@ -211,13 +185,11 @@ def process_ocr():
             "normalized_text": result_digits,
             "confidence": float(round(avg_confidence, 2)),
             "roi_image": roi_base64,
-            "engine": "railway-python-cnn-letterbox-api"
+            "engine": "railway-projection-profile-api"
         })
 
     except Exception as e:
         return jsonify({"success": False, "message": "Internal Server Error: " + str(e)}), 500
 
 if __name__ == '__main__':
-    # Jalankan server internal jika lokal test
-    import base64
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
