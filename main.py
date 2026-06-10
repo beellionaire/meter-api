@@ -163,9 +163,13 @@ def process_ocr():
             TARGET_SIZE = 64
             h, w = digit_crop.shape
 
+            # Jika potongan kosong (mencegah error)
+            if h == 0 or w == 0:
+                result_digits += "0"
+                confidences.append(0.0)
+                continue
+
             # 1. Pertahankan Aspect Ratio aslinya
-            # Kita ubah ukuran agar tingginya pas 64 piksel, lebar mengikuti secara proporsional.
-            # Menggunakan INTER_AREA untuk downsampling yang bersih, INTER_LINEAR untuk upsampling.
             interpolation = cv2.INTER_AREA if TARGET_SIZE < h else cv2.INTER_LINEAR
             scale = TARGET_SIZE / max(h, 1)
             new_w = int(w * scale)
@@ -173,8 +177,11 @@ def process_ocr():
 
             resized_digit = cv2.resize(digit_crop, (new_w, new_h), interpolation=interpolation)
 
-            # 2. Buat kanvas kotak 64x64 dengan warna latar belakang murni (diambil dari median pinggiran)
-            bg_color = int(np.median([digit_crop[0,:], digit_crop[-1,:], digit_crop[:,0], digit_crop[:,-1]]))
+            # 2. Buat kanvas kotak 64x64 dengan warna latar belakang murni
+            # PERBAIKAN ERROR NUMPY (menggabungkan sisi menjadi 1 dimensi dulu)
+            bg_pixels = np.concatenate([digit_crop[0,:], digit_crop[-1,:], digit_crop[:,0], digit_crop[:,-1]])
+            bg_color = int(np.median(bg_pixels)) if len(bg_pixels) > 0 else 255
+            
             canvas = np.full((TARGET_SIZE, TARGET_SIZE), bg_color, dtype=np.uint8)
 
             # 3. Tempelkan angka proporsional tadi tepat di TENGAH kanvas kotak
@@ -183,7 +190,7 @@ def process_ocr():
 
             canvas[y_offset : y_offset + new_h, x_offset : x_offset + new_w] = resized_digit
             
-            # Kita pakai 'canvas' untuk prediksi, bukan 'resized_crop' yang gepeng
+            # Kita pakai 'canvas' untuk prediksi
             debug_crops.append(canvas)
             img_array = canvas.astype('float32')
             img_array = np.expand_dims(np.expand_dims(img_array, axis=-1), axis=0)
