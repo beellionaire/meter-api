@@ -12,7 +12,7 @@ import tensorflow as tf
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 app = Flask(__name__)
-CORS(app) 
+CORS(app) # Mengizinkan Hostinger memanggil API ini tanpa terkena blokir CORS
 
 # --- LOAD MODEL CNN SECARA GLOBAL (HANYA 1 KALI SAAT START) ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -91,12 +91,17 @@ def process_ocr():
     if cnn_model is None:
         return jsonify({"success": False, "message": "Model AI belum terpasang di server Railway."}), 500
 
+    # PERBAIKAN: Gunakan force=True agar Flask memaksa baca JSON walau header dimodifikasi proxy
     data = request.get_json(force=True, silent=True)
     
-    if data is None or 'image' not in data or not data['image']:
+    if data is None:
+        return jsonify({"success": False, "message": "Format request bukan JSON atau payload terlalu besar."}), 400
+
+    if 'image' not in data or not data['image']:
         return jsonify({"success": False, "message": "Field 'image' kosong atau tidak ditemukan."}), 400
 
     try:
+        # Decode gambar base64
         encoded_data = data['image']
         if ',' in encoded_data:
             encoded_data = encoded_data.split(',')[1]
@@ -107,11 +112,14 @@ def process_ocr():
         if source is None:
             return jsonify({"success": False, "message": "Gambar rusak saat dikirim dari Hostinger."}), 400
 
+        # CEK SINYAL DARI HOSTINGER: Apakah sudah dipotong dari web?
         is_cropped = data.get('is_cropped', False)
 
         if is_cropped:
+            # JANGAN KEMANA-MANA: Langsung pakai gambar hasil guntingan dari Web!
             roi_trimmed = source
         else:
+            # JIKA USER UPLOAD FOTO DARI GALERI: Gunakan OpenCV untuk mencari kotaknya
             height, width = source.shape[:2]
             if width > 1400:
                 scale = 1400 / float(width)
@@ -126,48 +134,20 @@ def process_ocr():
             rcw, rch = min(max(int(rw * 0.96), 1), rw - rx), min(max(int(rh * 0.80), 1), rh - ry)
             roi_trimmed = roi[ry:ry + rch, rx:rx + rcw]
 
+        # PROSES POTONG 5 DIGIT SECARA RATA
         roi_gray = grayscale(roi_trimmed)
         th, tw = roi_gray.shape
-
-        # =================================================================
-        # PERBAIKAN STRATEGIS: AUTO-ALIGNMENT TRACKER (PENGUNCI POSISI DIGIT)
-        # =================================================================
-        # Deteksi area tinta hitam tulisan menggunakan binarisasi adaptif
-        thresh = cv2.adaptiveThreshold(roi_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 21, 10)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        valid_x = []
-        for ctr in contours:
-            bx, by, bw, bh = cv2.boundingRect(ctr)
-            # Filter objek: Harus memiliki tinggi komponen yang masuk akal dibanding tinggi boks ROI
-            if bh > th * 0.40 and bh < th * 0.95 and bw < tw * 0.25:
-                valid_x.extend([bx, bx + bw])
-        
-        # Pangkas area kosong pengganggu jika koordinat digit terluar berhasil dilacak
-        if len(valid_x) > 0:
-            min_x = max(min(valid_x) - 3, 0)  # Beri ruang toleransi 3 piksel
-            max_x = min(max(valid_x) + 3, tw)
-            digit_block = roi_gray[:, min_x:max_x]
-        else:
-            digit_block = roi_gray
-
-        # Lakukan pembagian 5 kolom seimbang pada area blok angka yang sudah rapi
-        bh, bw = digit_block.shape
-        digit_width = bw // 5
+        digit_width = tw // 5
         
         result_digits = ""
         confidences = []
-        debug_crops = []
         
         for i in range(5):
             start_x = i * digit_width
-            end_x = (i + 1) * digit_width if i < 4 else bw
-            digit_crop = digit_block[:, start_x:end_x]
+            end_x = (i + 1) * digit_width if i < 4 else tw
+            digit_crop = roi_gray[:, start_x:end_x]
             
-            # Gunakan INTER_CUBIC agar rekonstruksi garis vertikal tipis (seperti angka '1') tetap padat
-            resized_crop = cv2.resize(digit_crop, (64, 64), interpolation=cv2.INTER_CUBIC)
-            debug_crops.append(resized_crop)
-            
+            resized_crop = cv2.resize(digit_crop, (64, 64), interpolation=cv2.INTER_AREA)
             img_array = resized_crop.astype('float32')
             img_array = np.expand_dims(np.expand_dims(img_array, axis=-1), axis=0)
             
@@ -177,9 +157,8 @@ def process_ocr():
 
         avg_confidence = sum(confidences) / len(confidences)
         
-        # Kirimkan representasi visual boks pangkasan yang dilihat oleh AI
-        debug_view = np.hstack(debug_crops)
-        _, img_encoded = cv2.imencode('.jpg', debug_view)
+        # Konversi ROI ke base64 untuk dikirim balik
+        _, img_encoded = cv2.imencode('.jpg', roi_trimmed)
         roi_base64 = base64.b64encode(img_encoded).decode('utf-8')
 
         return jsonify({
@@ -187,12 +166,13 @@ def process_ocr():
             "normalized_text": result_digits,
             "confidence": float(round(avg_confidence, 2)),
             "roi_image": roi_base64,
-            "engine": "railway-python-cnn-aligned-api"
+            "engine": "railway-python-cnn-api"
         })
 
     except Exception as e:
         return jsonify({"success": False, "message": "Internal Server Error: " + str(e)}), 500
 
 if __name__ == '__main__':
+    # Jalankan server internal jika lokal test
     import base64
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
