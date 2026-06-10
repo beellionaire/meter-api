@@ -2,19 +2,18 @@ import os
 import json
 import re
 import cv2
-import base64
 import numpy as np
+import base64
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import tensorflow as tf
 
-# Matikan log TensorFlow yang mengganggu
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
 app = Flask(__name__)
-CORS(app) # Mengizinkan Hostinger memanggil API ini tanpa terkena blokir CORS
+CORS(app)
 
-# --- LOAD MODEL CNN SECARA GLOBAL (HANYA 1 KALI SAAT START) ---
+# --- LOAD MODEL CNN SECARA GLOBAL ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "models", "cnn_digit_meter.keras")
 
@@ -85,23 +84,16 @@ def find_digit_roi(image, gray, edges):
     final_y = anchor_y + y
     return image[final_y:final_y + ch, final_x:final_x + cw]
 
-# --- ROUTE UTAMA API ---
 @app.route('/api/ocr', methods=['POST'])
 def process_ocr():
     if cnn_model is None:
         return jsonify({"success": False, "message": "Model AI belum terpasang di server Railway."}), 500
 
-    # PERBAIKAN: Gunakan force=True agar Flask memaksa baca JSON walau header dimodifikasi proxy
     data = request.get_json(force=True, silent=True)
-    
-    if data is None:
-        return jsonify({"success": False, "message": "Format request bukan JSON atau payload terlalu besar."}), 400
-
-    if 'image' not in data or not data['image']:
-        return jsonify({"success": False, "message": "Field 'image' kosong atau tidak ditemukan."}), 400
+    if data is None or 'image' not in data or not data['image']:
+        return jsonify({"success": False, "message": "Gambar tidak diterima dengan benar."}), 400
 
     try:
-        # Decode gambar base64
         encoded_data = data['image']
         if ',' in encoded_data:
             encoded_data = encoded_data.split(',')[1]
@@ -110,16 +102,13 @@ def process_ocr():
         source = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
         if source is None:
-            return jsonify({"success": False, "message": "Gambar rusak saat dikirim dari Hostinger."}), 400
+            return jsonify({"success": False, "message": "Gambar rusak."}), 400
 
-        # CEK SINYAL DARI HOSTINGER: Apakah sudah dipotong dari web?
         is_cropped = data.get('is_cropped', False)
 
         if is_cropped:
-            # JANGAN KEMANA-MANA: Langsung pakai gambar hasil guntingan dari Web!
             roi_trimmed = source
         else:
-            # JIKA USER UPLOAD FOTO DARI GALERI: Gunakan OpenCV untuk mencari kotaknya
             height, width = source.shape[:2]
             if width > 1400:
                 scale = 1400 / float(width)
@@ -134,21 +123,67 @@ def process_ocr():
             rcw, rch = min(max(int(rw * 0.96), 1), rw - rx), min(max(int(rh * 0.80), 1), rh - ry)
             roi_trimmed = roi[ry:ry + rch, rx:rx + rcw]
 
-        # PROSES POTONG 5 DIGIT SECARA RATA
         roi_gray = grayscale(roi_trimmed)
         th, tw = roi_gray.shape
-        digit_width = tw // 5
+
+        # --- UPGRADE: SEGMENTASI DIGIT PINTAR DENGAN CONTOUR ---
+        # Lakukan binarisasi untuk memisahkan angka (gelap) dari background (terang)
+        _, thresh = cv2.threshold(roi_gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
+        digit_boxes = []
+        for ctr in contours:
+            bx, by, bw, bh = cv2.boundingRect(ctr)
+            # Filter objek: Harus memiliki tinggi minimal 45% dari kotak ROI dan lebar tidak boleh terlalu raksasa
+            if bh > th * 0.45 and bw < tw * 0.28:
+                digit_boxes.append((bx, by, bw, bh))
+        
+        # Urutkan koordinat kotak dari kiri ke kanan
+        digit_boxes = sorted(digit_boxes, key=lambda b: b[0])
+
+        # Jika berhasil mengunci tepat 5 objek angka, gunakan koordinat pintar ini
+        if len(digit_boxes) == 5:
+            using_smart_segment = True
+        else:
+            using_smart_segment = False
+
         result_digits = ""
         confidences = []
-        
+        debug_crops = []
+
         for i in range(5):
-            start_x = i * digit_width
-            end_x = (i + 1) * digit_width if i < 4 else tw
-            digit_crop = roi_gray[:, start_x:end_x]
+            if using_smart_segment:
+                bx, by, bw, bh = digit_boxes[i]
+                digit_crop = roi_gray[by:by+bh, bx:bx+bw]
+            else:
+                # Cadangan jika framing buruk: Potong rata bagi 5
+                digit_width = tw // 5
+                start_x = i * digit_width
+                end_x = (i + 1) * digit_width if i < 4 else tw
+                digit_crop = roi_gray[:, start_x:end_x]
+
+            # --- SELESAIKAN MASALAH ANGKA MELAR (LETTERBOXING DENGAN DYNAMIC PADDING) ---
+            ch, cw = digit_crop.shape
+            target_size = 64
+            scale = target_size / max(ch, 1)
+            new_w = int(cw * scale)
+            new_h = int(ch * scale)
             
-            resized_crop = cv2.resize(digit_crop, (64, 64), interpolation=cv2.INTER_AREA)
-            img_array = resized_crop.astype('float32')
+            # Gunakan interpolasi linear untuk pembesaran objek kecil (seperti angka 1)
+            resized = cv2.resize(digit_crop, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            
+            # Deteksi warna dominan di pinggiran potongan untuk dijadikan warna kanvas latar
+            bg_color = int(np.median([digit_crop[0, :], digit_crop[-1, :], digit_crop[:, 0], digit_crop[:, -1]]))
+            canvas = np.full((target_size, target_size), bg_color, dtype=np.uint8)
+            
+            # Tempel angka tepat di tengah kanvas tanpa merusak Aspect Ratio aslinya
+            dx = (target_size - new_w) // 2
+            dy = (target_size - new_h) // 2
+            canvas[dy:dy+new_h, dx:dx+new_w] = resized
+            debug_crops.append(canvas)
+
+            # Prediksi via Model CNN
+            img_array = canvas.astype('float32')
             img_array = np.expand_dims(np.expand_dims(img_array, axis=-1), axis=0)
             
             predictions = cnn_model.predict(img_array, verbose=0)
@@ -157,8 +192,9 @@ def process_ocr():
 
         avg_confidence = sum(confidences) / len(confidences)
         
-        # Konversi ROI ke base64 untuk dikirim balik
-        _, img_encoded = cv2.imencode('.jpg', roi_trimmed)
+        # Kirim visualisasi potongan binarisasi yang dilihat oleh mata AI ke Hostinger
+        debug_view = np.hstack(debug_crops)
+        _, img_encoded = cv2.imencode('.jpg', debug_view)
         roi_base64 = base64.b64encode(img_encoded).decode('utf-8')
 
         return jsonify({
@@ -166,13 +202,11 @@ def process_ocr():
             "normalized_text": result_digits,
             "confidence": float(round(avg_confidence, 2)),
             "roi_image": roi_base64,
-            "engine": "railway-python-cnn-api"
+            "engine": "railway-python-cnn-smart-contour-api"
         })
 
     except Exception as e:
         return jsonify({"success": False, "message": "Internal Server Error: " + str(e)}), 500
 
 if __name__ == '__main__':
-    # Jalankan server internal jika lokal test
-    import base64
     app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 5000)))
