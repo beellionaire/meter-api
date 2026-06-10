@@ -101,36 +101,40 @@ def process_ocr():
         return jsonify({"success": False, "message": "Field 'image' kosong atau tidak ditemukan."}), 400
 
     try:
-        # Decode gambar base64 dari Hostinger
+        # Decode gambar base64
         encoded_data = data['image']
-        # Pastikan kita hanya mengambil data setelah koma (base64 murni)
         if ',' in encoded_data:
             encoded_data = encoded_data.split(',')[1]
             
         nparr = np.frombuffer(base64.b64decode(encoded_data), np.uint8)
         source = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-        # Validasi jika gambar Base64 terpotong/rusak saat di perjalanan
         if source is None:
             return jsonify({"success": False, "message": "Gambar rusak saat dikirim dari Hostinger."}), 400
 
-        # Preprocessing Gambar
-        height, width = source.shape[:2]
-        if width > 1400:
-            scale = 1400 / float(width)
-            source = cv2.resize(source, (1400, max(int(height * scale), 1)), interpolation=cv2.INTER_AREA)
+        # CEK SINYAL DARI HOSTINGER: Apakah sudah dipotong dari web?
+        is_cropped = data.get('is_cropped', False)
 
-        gray = grayscale(source)
-        edges = prewitt_edges(gray)
-        roi = find_digit_roi(source, gray, edges)
-        
-        # Trim ROI Border
-        rh, rw = roi.shape[:2]
-        rx, ry = max(int(rw * 0.02), 1), max(int(rh * 0.10), 1)
-        rcw, rch = min(max(int(rw * 0.96), 1), rw - rx), min(max(int(rh * 0.80), 1), rh - ry)
-        roi_trimmed = roi[ry:ry + rch, rx:rx + rcw]
+        if is_cropped:
+            # JANGAN KEMANA-MANA: Langsung pakai gambar hasil guntingan dari Web!
+            roi_trimmed = source
+        else:
+            # JIKA USER UPLOAD FOTO DARI GALERI: Gunakan OpenCV untuk mencari kotaknya
+            height, width = source.shape[:2]
+            if width > 1400:
+                scale = 1400 / float(width)
+                source = cv2.resize(source, (1400, max(int(height * scale), 1)), interpolation=cv2.INTER_AREA)
 
-        # Proses pembacaan 5 digit rata oleh CNN
+            gray = grayscale(source)
+            edges = prewitt_edges(gray)
+            roi = find_digit_roi(source, gray, edges)
+            
+            rh, rw = roi.shape[:2]
+            rx, ry = max(int(rw * 0.02), 1), max(int(rh * 0.10), 1)
+            rcw, rch = min(max(int(rw * 0.96), 1), rw - rx), min(max(int(rh * 0.80), 1), rh - ry)
+            roi_trimmed = roi[ry:ry + rch, rx:rx + rcw]
+
+        # PROSES POTONG 5 DIGIT SECARA RATA
         roi_gray = grayscale(roi_trimmed)
         th, tw = roi_gray.shape
         digit_width = tw // 5
@@ -153,7 +157,7 @@ def process_ocr():
 
         avg_confidence = sum(confidences) / len(confidences)
         
-        # Konversi ROI ke base64 untuk dikirim balik ke UI Hostinger
+        # Konversi ROI ke base64 untuk dikirim balik
         _, img_encoded = cv2.imencode('.jpg', roi_trimmed)
         roi_base64 = base64.b64encode(img_encoded).decode('utf-8')
 
@@ -166,7 +170,6 @@ def process_ocr():
         })
 
     except Exception as e:
-        # Menangkap error spesifik di server
         return jsonify({"success": False, "message": "Internal Server Error: " + str(e)}), 500
 
 if __name__ == '__main__':
